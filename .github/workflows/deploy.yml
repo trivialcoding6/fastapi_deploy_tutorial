@@ -1,0 +1,89 @@
+# 워크플로우의 이름 지정
+name: Deploy to Azure Container Apps
+
+# main 브랜치에 코드가 푸시될 때 자동 실행
+on:
+  push:
+    branches:
+      - main
+
+# GitHub Actions 실행 권한 설정 (Azure OIDC 인증 & 코드 읽기)
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  build-and-deploy:
+    # GitHub Actions 실행 환경을 Ubuntu 최신 버전으로 설정
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1️⃣ GitHub 레포지토리 코드 가져오기
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      # 2️⃣ Azure 로그인 (GitHub Actions에서 OIDC를 통해 보안 인증)
+      - name: Azure Login using Credentials
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      # 3️⃣ Docker 이미지 빌드 & ACR(Azure Container Registry)로 푸시
+      # Git SHA를 기반으로 고유한 태그 생성
+      # Azure에서 직접 Docker 이미지를 빌드하고 ACR에 Push
+      - name: Build and Push Docker Image to ACR
+        run: |
+          az acr login --name ${{ secrets.REGISTRY_NAME }}
+
+          IMAGE_TAG="${{ secrets.REGISTRY_NAME }}.azurecr.io/${{ secrets.IMAGE_NAME }}:${{ github.sha }}"
+          LATEST_TAG="${{ secrets.REGISTRY_NAME }}.azurecr.io/${{ secrets.IMAGE_NAME }}:latest"
+
+          az acr build --registry ${{ secrets.REGISTRY_NAME }} \
+            --image $IMAGE_TAG \
+            --image $LATEST_TAG \
+            .
+
+      # 4️⃣ Azure Container Apps 환경이 존재하는지 확인 & 없으면 생성
+      - name: Ensure Container Apps Environment Exists
+        run: |
+          ENV_EXISTS=$(az containerapp env show --name ${{ secrets.CONTAINER_APP_ENV }} --resource-group ${{ secrets.RESOURCE_GROUP }} --query "name" --output tsv || echo "notfound")
+
+          if [ "$ENV_EXISTS" = "notfound" ]; then
+            echo "Container Apps Environment not found. Creating..."
+            az containerapp env create \
+              --name ${{ secrets.CONTAINER_APP_ENV }} \
+              --resource-group ${{ secrets.RESOURCE_GROUP }} \
+              --location ${{ secrets.LOCATION }}
+          else
+            echo "Container Apps Environment exists."
+          fi
+
+      # 5️⃣ Azure Container Apps 배포 (앱이 없으면 생성, 있으면 업데이트)
+      - name: Deploy to Azure Container Apps (Create or Update)
+        run: |
+          IMAGE_TAG=${{ secrets.REGISTRY_NAME }}.azurecr.io/${{ secrets.IMAGE_NAME }}:latest
+
+          APP_EXISTS=$(az containerapp show --name ${{ secrets.CONTAINER_APP }} --resource-group ${{ secrets.RESOURCE_GROUP }} --query "name" --output tsv || echo "notfound")
+
+          if [ "$APP_EXISTS" = "notfound" ]; then
+            echo "Container App not found. Creating..."
+            az containerapp create \
+              --name ${{ secrets.CONTAINER_APP }} \
+              --resource-group ${{ secrets.RESOURCE_GROUP }} \
+              --environment ${{ secrets.CONTAINER_APP_ENV }} \
+              --image $IMAGE_TAG \
+              --target-port 800 \
+              --ingress external \
+              --registry-server ${{ secrets.REGISTRY_NAME }}.azurecr.io \
+              --registry-username $(az acr credential show --name ${{ secrets.REGISTRY_NAME }} --query "username" --output tsv) \
+              --registry-password $(az acr credential show --name ${{ secrets.REGISTRY_NAME }} --query "passwords[0].value" --output tsv) \
+              --env-vars ENV_MODE=${{ secrets.ENV_MODE }} API_KEY=${{ secrets.API_KEY }}
+          else
+            # 앱이 있으면 최신 Docker 이미지로 업데이트
+            echo "Container App found. Updating..."
+            az containerapp update \
+              --name ${{ secrets.CONTAINER_APP }} \
+              --resource-group ${{ secrets.RESOURCE_GROUP }} \
+              --image $IMAGE_TAG \
+              --set-env-vars ENV_MODE=${{ secrets.ENV_MODE }} API_KEY=${{ secrets.API_KEY }}
+          fi
